@@ -1,5 +1,4 @@
 <script setup lang="ts">
-
 definePageMeta({
   layout: "default",
 });
@@ -7,12 +6,14 @@ definePageMeta({
 const { cart, clearCart, loadCart } = useCart();
 
 const orderPlaced = ref(false);
-
 const orderError = ref("");
+const loading = ref(false);
 
 // Payment & Modal state
 const showPaymentModal = ref(false);
 const paymentLoading = ref(false);
+const isFinalizing = ref(false);
+
 const qrData = ref<{
   qr_image: string;
   md5: string;
@@ -21,22 +22,15 @@ const qrData = ref<{
   currency: string;
 } | null>(null);
 
-let pollInterval: NodeJS.Timeout | null = null;
+let pollInterval: ReturnType<typeof setInterval> | null = null;
 
 const orderForm = reactive({
-
   firstName: "",
-
   lastName: "",
-
   email: "",
-
   phone: "",
-
   address: "",
-
   city: "",
-
   postalCode: "",
 });
 
@@ -44,42 +38,22 @@ const API_URL = "http://localhost:8000"; // JSON Server / Main API
 const FLASK_API_URL = "http://localhost:5000"; // Flask Bakong KHQR Server
 
 const subtotal = computed(() => {
-
   return cart.value.reduce(
-
-    (total, item) =>
-
-      total +
-      Number(item.price) *
-      item.quantity,
-
+    (total, item) => total + Number(item.price) * item.quantity,
     0
-
   );
-
 });
 
-
 // =========================================================
-// SHIPPING
+// SHIPPING & TOTAL
 // =========================================================
 
 const shipping = computed(() => {
-
-  if (subtotal.value >= 100) {
-
+  if (subtotal.value >= 100 || subtotal.value === 0) {
     return 0;
-
   }
-
   return 5;
-
 });
-
-
-// =========================================================
-// TOTAL
-// =========================================================
 
 const total = computed(() => {
   return subtotal.value + shipping.value;
@@ -87,6 +61,8 @@ const total = computed(() => {
 
 // Step 1: Initiate payment and show Bakong Modal
 const startCheckout = async () => {
+  if (cart.value.length === 0) return;
+
   loading.value = true;
   orderError.value = "";
 
@@ -98,7 +74,7 @@ const startCheckout = async () => {
       const stock = Math.max(0, Number(book.stock) || 0);
       if (item.quantity > stock) {
         throw new Error(
-          `"${item.title}" only has ${stock} ${stock === 1 ? "copy" : "copies"} left in stock.`,
+          `"${item.title}" only has ${stock} ${stock === 1 ? "copy" : "copies"} left in stock.`
         );
       }
     }
@@ -117,17 +93,21 @@ const startCheckout = async () => {
     });
 
     if (qrResponse && qrResponse.success) {
+      // Ensure image source is formatted correctly as base64 URI
+      const rawImage = qrResponse.qr_image || "";
+      qrResponse.qr_image = rawImage.startsWith("data:image")
+        ? rawImage
+        : `data:image/png;base64,${rawImage}`;
+
       qrData.value = qrResponse;
       startPaymentPolling(qrResponse.md5);
     } else {
       throw new Error("Could not generate KHQR payment code.");
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Checkout failed:", error);
     orderError.value =
-      error instanceof Error
-        ? error.message
-        : "Failed to initiate payment. Please try again.";
+      error?.message || "Failed to initiate payment. Please try again.";
     showPaymentModal.value = false;
   } finally {
     loading.value = false;
@@ -141,9 +121,9 @@ const startPaymentPolling = (md5: string) => {
   pollInterval = setInterval(async () => {
     try {
       const res = await $fetch<any>(
-        `${FLASK_API_URL}/api/check-payment?md5=${md5}`,
+        `${FLASK_API_URL}/api/check-payment?md5=${md5}`
       );
-      if (res.status === "PAID") {
+      if (res.status === "PAID" && !isFinalizing.value) {
         stopPaymentPolling();
         await finalizeOrder();
       }
@@ -168,10 +148,18 @@ const cancelPayment = () => {
 
 // Step 3: Complete order once KHQR turns PAID
 const finalizeOrder = async () => {
+  if (isFinalizing.value) return;
+  isFinalizing.value = true;
+
+  const orderItems = JSON.parse(JSON.stringify(cart.value));
+  const orderSubtotal = subtotal.value;
+  const orderShipping = shipping.value;
+  const orderTotal = total.value;
+
   const decrementedBooks: Array<{ id: string | number; stock: number }> = [];
 
   try {
-    for (const item of cart.value) {
+    for (const item of orderItems) {
       const bookId = item.productId ?? item.id;
       const book = await $fetch<any>(`${API_URL}/books/${bookId}`);
       const stock = Math.max(0, Number(book.stock) || 0);
@@ -192,10 +180,10 @@ const finalizeOrder = async () => {
         address: orderForm.address.trim(),
         city: orderForm.city.trim(),
         postalCode: orderForm.postalCode.trim(),
-        items: cart.value.map((item) => ({ ...item })),
-        subtotal: subtotal.value,
-        shipping: shipping.value,
-        total: total.value,
+        items: orderItems,
+        subtotal: orderSubtotal,
+        shipping: orderShipping,
+        total: orderTotal,
         status: "paid",
         billNumber: qrData.value?.bill_number,
         createdAt: new Date().toISOString(),
@@ -205,10 +193,10 @@ const finalizeOrder = async () => {
     showPaymentModal.value = false;
     orderPlaced.value = true;
 
-
     await clearCart();
   } catch (error) {
     console.error("Order finalization failed:", error);
+    // Rollback decremented stock on failure
     for (const book of decrementedBooks) {
       await $fetch(`${API_URL}/books/${book.id}`, {
         method: "PATCH",
@@ -216,34 +204,21 @@ const finalizeOrder = async () => {
       }).catch(() => undefined);
     }
 
-
     orderError.value =
       "Payment succeeded, but recording your order failed. Please contact support.";
+  } finally {
+    isFinalizing.value = false;
   }
 };
 
 onMounted(() => {
-
   loadCart();
-
-});
-
-
-// =========================================================
-// CLEANUP
-// =========================================================
-
-onBeforeUnmount(() => {
-
-  stopPaymentChecking();
-
 });
 
 onUnmounted(() => {
   stopPaymentPolling();
 });
 </script>
-
 
 <template>
   <div class="min-h-screen bg-gray-50/50 text-slate-900 font-sans antialiased">
@@ -575,5 +550,4 @@ onUnmounted(() => {
       </Transition>
     </main>
   </div>
-
 </template>
